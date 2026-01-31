@@ -1,0 +1,10 @@
+streamlit
+opencv-python
+numpy
+ultralytics
+deep-sort-realtime
+torch
+torchvision
+Pillow
+mtcnn
+facenet-pytorch
