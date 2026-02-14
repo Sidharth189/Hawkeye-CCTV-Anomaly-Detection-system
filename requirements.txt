@@ -1,4 +1,3 @@
-streamlit
 opencv-python
 numpy
 ultralytics
@@ -8,3 +7,8 @@ torchvision
 Pillow
 mtcnn
 facenet-pytorch
+dotenv
+fastapi
+python-multipart
+setuptools==69.5.1
+uvicorn
