@@ -3,7 +3,9 @@ import torch
 import numpy as np
 import shutil
 import os
-from fastapi import FastAPI, UploadFile, File, Form
+import time
+import threading
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -17,6 +19,11 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import detection_ops
 from backend.alert_utils import AlertManager
 from backend import api
+from pydantic import BaseModel
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
 
 app = FastAPI()
 
@@ -34,24 +41,32 @@ if not os.path.exists("captured_faces"):
     os.makedirs("captured_faces")
 if not os.path.exists("trusted_faces"):
     os.makedirs("trusted_faces")
+if not os.path.exists("uploads"):
+    os.makedirs("uploads")
 
 app.mount("/captured_faces", StaticFiles(directory="captured_faces"), name="captured_faces")
 app.mount("/trusted_faces", StaticFiles(directory="trusted_faces"), name="trusted_faces")
 
 app.include_router(api.router)
 
+# Optimization for Windows Stability
+cv2.setNumThreads(0)
+
 # Global State
 class VideoState:
     def __init__(self):
         self.video_source = "test_video.mp4" # Default
-        self.using_webcam = False
+        self.using_webcam = True
         self.cap = None
         self.reload_cap = True
+        self.latest_frame = None
+        self.lock = threading.Lock()
+        self.running = True
         
         # Models
         self.use_cuda = torch.cuda.is_available()
         self.device = 'cuda' if self.use_cuda else 'cpu'
-        print("Loading YOLO...")
+        print(f"Loading YOLO on {self.device}...")
         self.yolo_model = YOLO("yolov8s.pt")
         print("Loading DeepSort...")
         self.deepsort_tracker = DeepSort(
@@ -81,12 +96,17 @@ class VideoState:
         self.saved_untrusted_session = set()
         self.frame_count = 0
         
+        # Statistics
+        self.current_occupancy = 0
+        self.peak_occupancy = 0
+        self.total_alerts = 0
+        
         # Settings
         self.settings = {
             'loitering_threshold': 10,
             'crowd_threshold': 60,     
             'confidence_threshold': 0.15, 
-            'trespassing_zone': [200, 300, 300, 350], # List for JSON compatibility
+            'trespassing_zone': [200, 300, 300, 350],
             'trespassing_enabled': True,
             'loitering_enabled': True,
             'crowd_enabled': True
@@ -95,100 +115,135 @@ class VideoState:
         # Alert Manager
         self.alert_manager = AlertManager()
 
+    def get_capture(self):
+        if self.reload_cap or self.cap is None or not self.cap.isOpened():
+            if self.cap:
+                try:
+                    self.cap.release()
+                except:
+                    pass
+                
+            source = 0 if self.using_webcam else self.video_source
+            print(f"[DEBUG] Opening video source: {source}")
+            
+            if self.using_webcam:
+                # Use DSHOW on Windows for better stability with webcams
+                self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+            else:
+                self.cap = cv2.VideoCapture(source)
+                
+            if not self.cap.isOpened():
+                print(f"[ERROR] Failed to open source: {source}")
+                self.reload_cap = True
+                return None
+            
+            print(f"[DEBUG] Source opened successfully: {source}")
+            self.reload_cap = False
+            self.frame_count = 0
+            self.track_history.clear()
+            self.loitering_saved.clear()
+            self.saved_untrusted_session.clear()
+            self.deepsort_tracker.delete_all_tracks()
+            
+            if self.mtcnn:
+                from backend import database
+                self.known_faces = database.get_trusted_faces()
+            
+        return self.cap
+
+    def process_video(self):
+        print("[DEBUG] Background video processing loop started.")
+        while self.running:
+            cap = self.get_capture()
+            if not cap:
+                time.sleep(1)
+                continue
+                
+            ret, frame = cap.read()
+            if not ret:
+                if not self.using_webcam:
+                    self.frame_count = 0
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    continue
+                else:
+                    print("[DEBUG] Capture read failed, retrying in 1s...")
+                    self.reload_cap = True
+                    time.sleep(1)
+                    continue
+                    
+            self.frame_count += 1
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30
+            current_time = self.frame_count / fps
+            
+            # Run Detection
+            detections_list = []
+            results = self.yolo_model(
+                frame, stream=True, conf=self.settings['confidence_threshold'], 
+                device=self.device if self.device == 'cpu' else 0, imgsz=640, verbose=False
+            )
+            
+            for result in results:
+                boxes = result.boxes.cpu().numpy()
+                for box in boxes:
+                    x1, y1, x2, y2 = box.xyxy[0]
+                    conf = box.conf[0]
+                    cls_id = int(box.cls[0])
+                    if cls_id == 0: # Person
+                        w = x2 - x1
+                        h = y2 - y1
+                        detections_list.append([[x1, y1, w, h], conf, 0])
+            
+            # Tracker
+            tracks = self.deepsort_tracker.update_tracks(detections_list, frame=frame)
+            
+            # Annotate
+            curr_settings = self.settings.copy()
+            curr_settings['trespassing_zone'] = tuple(self.settings['trespassing_zone'])
+            
+            final_frame, alerts, self.saved_untrusted_session = detection_ops.process_frame_annotations(
+                frame, tracks, current_time, 
+                self.track_history, self.loitering_saved, curr_settings,
+                mtcnn=self.mtcnn,
+                resnet=self.resnet,
+                known_faces=self.known_faces,
+                device=self.device,
+                saved_untrusted_session=self.saved_untrusted_session
+            )
+            
+            # Process Alerts
+            self.alert_manager.process_alerts(alerts)
+            
+            # Update Stats
+            self.current_occupancy = alerts['count']
+            if self.current_occupancy > self.peak_occupancy:
+                self.peak_occupancy = self.current_occupancy
+            
+            # Encoding
+            ret, buffer = cv2.imencode('.jpg', final_frame)
+            if ret:
+                with self.lock:
+                    self.latest_frame = buffer.tobytes()
+            
+            # Small sleep to yield
+            time.sleep(0.01)
+
 state = VideoState()
 
-def get_video_capture():
-    if state.reload_cap or state.cap is None or not state.cap.isOpened():
-        if state.cap:
-            state.cap.release()
-            
-        source = 0 if state.using_webcam else state.video_source
-        if not state.using_webcam and not os.path.exists(str(source)):
-             print(f"File not found: {source}")
-             return None
-             
-        state.cap = cv2.VideoCapture(source)
-        state.reload_cap = False
-        state.frame_count = 0
-        state.track_history.clear()
-        state.loitering_saved.clear()
-        state.saved_untrusted_session.clear()
-        # Reset tracker on new source otherwise it gets confused
-        state.deepsort_tracker.delete_all_tracks()
-        
-        # Refresh trusted faces on restart/reload
-        if state.mtcnn:
-            from backend import database
-            state.known_faces = database.get_trusted_faces()
-        
-    return state.cap
+@app.on_event("startup")
+async def startup_event():
+    threading.Thread(target=state.process_video, daemon=True).start()
 
 def generate_frames():
     while True:
-        cap = get_video_capture()
-        if not cap:
-            break
+        if state.latest_frame is not None:
+            with state.lock:
+                frame_bytes = state.latest_frame
             
-        ret, frame = cap.read()
-        if not ret:
-            # If it's a file, loop it
-            if not state.using_webcam:
-                state.frame_count = 0
-                state.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                continue
-            else:
-                break
-                
-        state.frame_count += 1
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        current_time = state.frame_count / fps
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
         
-        # Run Detection
-        detections_list = []
-        results = state.yolo_model(
-            frame, stream=True, conf=state.settings['confidence_threshold'], 
-            device=state.device if state.device == 'cpu' else 0, imgsz=640, verbose=False
-        )
-        
-        for result in results:
-            boxes = result.boxes.cpu().numpy()
-            for box in boxes:
-                x1, y1, x2, y2 = box.xyxy[0]
-                conf = box.conf[0]
-                cls_id = int(box.cls[0])
-                if cls_id == 0: # Person
-                    w = x2 - x1
-                    h = y2 - y1
-                    detections_list.append([[x1, y1, w, h], conf, 0])
-        
-        # Tracker
-        tracks = state.deepsort_tracker.update_tracks(detections_list, frame=frame)
-        
-        # Annotate
-        # Convert list to tuple for detection_ops if needed, though list is usually fine
-        # Ensure zone is tuple
-        current_settings = state.settings.copy()
-        current_settings['trespassing_zone'] = tuple(state.settings['trespassing_zone'])
-        
-        final_frame, alerts, state.saved_untrusted_session = detection_ops.process_frame_annotations(
-            frame, tracks, current_time, 
-            state.track_history, state.loitering_saved, current_settings,
-            mtcnn=state.mtcnn,
-            resnet=state.resnet,
-            known_faces=state.known_faces,
-            device=state.device,
-            saved_untrusted_session=state.saved_untrusted_session
-        )
-        
-        # Process Alerts
-        state.alert_manager.process_alerts(alerts)
-        
-        # Encoding
-        ret, buffer = cv2.imencode('.jpg', final_frame)
-        frame_bytes = buffer.tobytes()
-        
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+        # Sleep to match typical camera high-end FPS or just yield
+        time.sleep(0.03) # ~30 FPS output
 
 @app.get("/video_feed")
 def video_feed():
@@ -203,25 +258,45 @@ def update_settings(new_settings: dict):
     state.settings.update(new_settings)
     return {"status": "updated", "settings": state.settings}
 
+@app.get("/stats")
+def get_stats():
+    alerts = state.alert_manager.recent_alerts if hasattr(state.alert_manager, 'recent_alerts') else []
+    return {
+        "occupancy": state.current_occupancy,
+        "peak_occupancy": state.peak_occupancy,
+        "total_alerts": state.alert_manager.alert_count,
+        "alerts": alerts
+    }
+
 @app.post("/set_source")
-def set_source(source_type: str = Form(...)): # 'webcam' or 'file'
+def set_source(source_type: str = Form(...)):
     if source_type == 'webcam':
         state.using_webcam = True
     else:
-        state.using_webcam = False # Will use last uploaded file
+        state.using_webcam = False
     state.reload_cap = True
     return {"status": "source_changed", "type": source_type}
 
 @app.post("/upload_video")
 async def upload_video(file: UploadFile = File(...)):
-    file_location = f"uploaded_{file.filename}"
+    file_location = os.path.abspath(f"uploads/{file.filename}")
     with open(file_location, "wb+") as file_object:
         shutil.copyfileobj(file.file, file_object)
     
     state.video_source = file_location
     state.using_webcam = False
     state.reload_cap = True
-    return {"status": "file_uploaded", "filename": file_location}
+    return {"status": "file_uploaded", "filename": file.filename}
+
+@app.post("/login")
+def login(creds: LoginRequest):
+    admin_user = os.getenv("ADMIN_USERNAME", "admin")
+    admin_pass = os.getenv("ADMIN_PASSWORD", "admin")
+    
+    if creds.username == admin_user and creds.password == admin_pass:
+        return {"token": "authenticated_session_token", "message": "Login successful"}
+    else:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
 
 if __name__ == "__main__":
     import uvicorn

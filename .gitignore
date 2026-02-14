@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.env
+
+# Database
+*.db
+backend/faces.db
+
+# Machine Learning (YOLOv8 weights)
+*.pt
+
+# Backend specific uploads/trusted faces
+backend/uploads/
+backend/trusted_faces/
+
+# Next.js (Frontend)
+.next/
+out/
+build/
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
